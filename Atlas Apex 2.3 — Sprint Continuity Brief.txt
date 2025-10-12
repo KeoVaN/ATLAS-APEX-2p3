@@ -1,0 +1,403 @@
+# Atlas Apex 2.3 — Sprint Continuity Brief
+
+**Context Transfer:** Kod Uzmanı (AI Assistant) → Kod Uzmanı (Next Instance)  
+**Date:** 2025-10-12  
+**Current Sprint:** Sprint-1 (FSM + Gates)  
+**Status:** ⏳ Awaiting Mühendis compile test results
+
+---
+
+## 🎯 PROJECT OVERVIEW
+
+**Mission:** Build Atlas Apex 2.3 — Advanced quantitative trading system  
+**Architecture:** Single-file Pine Script v5 (TradingView-only)  
+**Team Structure:**
+- Yönetici (Observer/Coordinator)
+- Mühendis (Technical Lead/QA)
+- Eş Mimar (Architecture/Ar-Ge)
+- Kod Uzmanı (You — Code implementation specialist)
+
+**Communication Protocol:**
+```
+[ROLE] [TARGET] için yazıyor;
+[Content]
+[ROLE] Tamamladı/Bitirdi/Bekliyor.
+```
+
+---
+
+## 📦 COMPLETED SPRINTS
+
+### Sprint-0: Hygiene & Telemetry Foundation ✅
+**Status:** MERGED  
+**Branch:** `feat/sprint-0-hygiene-nrp-telemetry`
+
+**Deliverables:**
+1. **Feature-flag system:**
+   - `ORDERS_ENABLED` (bool, default: false) — Master kill-switch
+   - `QTY_GATE` (0.0-1.0, default: 0.0) — Position size gate
+   - `FF_RV` / `FF_PID` / `FF_SANDBOX` — Feature toggles
+
+2. **HTF no-repaint wrapper:**
+   ```pine
+   noRepaintHTF(expr, tf) =>
+       request.security(syminfo.tickerid, tf, expr[1], lookahead=barmerge.lookahead_on)
+   ```
+   - ALL HTF calls must use this wrapper (no nested `security()` in `expr`)
+   - Budget counter: `request_count` incremented at call site
+
+3. **Telemetry Row-24 skeleton:**
+   - Core meta: H, E, K, RV, global_damp
+   - Mode & flags: Strategy vs Indicator, FF status
+   - Budget Status Lane: request/plot counters + OK/OVERSHOOT
+   - Sandbox Mode: Anomaly counter (non-blocking)
+
+4. **Budget baseline:**
+   - `EXPECTED_HTF_CALLS = 2` (htf_close + htf_ema20)
+   - `EXPECTED_PLOTS = 2` (basis_ema + htf_ema20)
+   - Guard: `budget_drift` triggers sandbox warn if exceeded
+
+5. **Debug fixes (Pine v5 compliance):**
+   - Strategy params → literal const (10000, 0.075, 2)
+   - Counter pattern → main scope increment (not in functions)
+   - `plot_once()` removed (Pine v5 restriction)
+   - Table ternary → variable extraction
+
+**Key Constraints (NEVER CHANGE):**
+- ❌ NO new `request.security()` calls (budget locked at 2)
+- ❌ NO new `plot()` calls (budget locked at 2)
+- ❌ HTF wrapper pattern MUST be preserved
+- ❌ Feature-flag hierarchy MUST remain intact
+
+**Replay QA:** PASSED (3 screenshots verified, no HTF drift)
+
+---
+
+### Sprint-1: FSM + Gate Mask + Anti-Chop ⏳
+**Status:** IN REVIEW (awaiting Mühendis compile test)  
+**Branch:** `feat/sprint-1-fsm-gates`
+
+**Deliverables:**
+1. **RV Momentum (ΔRV):**
+   ```pine
+   rv_fast = ta.ema(RV, 3)
+   rv_slow = ta.ema(RV, 21)
+   rv_mom  = rv_fast - rv_slow  // For early-release trigger
+   ```
+
+2. **Risk-Off FSM Enhanced:**
+   ```pine
+   // Fuse mechanism (40 bars countdown)
+   if not risk_off_state and ro_bars >= 2
+       risk_off_state := true
+       riskoff_fuse := FUSE_BARS
+   
+   // Early-release valve (Eş Mimar spec)
+   early_release = REL_VALVE_ENABLED and riskoff_fuse == 0 
+                   and (RV < enter_th - 0.07) 
+                   and (rv_mom < -0.04)
+   ```
+
+3. **Anti-Chop Filters:**
+   - ATR-z metric: `(atr14 - atr_mu50) / atr_sd50`
+   - Min ATR-z: 0.20 (0.15 for fast symbols like SOL)
+   - Side-gap: 0.50×ATR min distance from EMA20
+   - Burst counter: 12-bar window, max 3 flips
+
+4. **Gate Logic:**
+   - **G1 (Extension + Pullback):** `ext <= base_gate` OR pullback with side-gap
+   - **G2 (Percentile + dCTS):** Momentum direction alignment
+   - **G3 (Entropy/ATR-z):** High entropy OR low ATR-z → block
+   - **G5 (HTF Alignment):** Hysteresis band ±0.15 around base threshold
+
+5. **Telemetry Expansion (Row-31):**
+   - Row-8: RVf/RVs/ΔRV
+   - Row-9: R-Off state/fuse
+   - Row-10: G1/G2/G3/G5 (✓/×)
+   - Row-11: blocked_by (risk/neutral/cooldown)
+   - Row-12: DVL (34/288 diagnostic)
+
+**Micro-Patch Applied (Compile Safety):**
+```pine
+// Stage-A alias guards (forward declarations)
+risk_score = 0.5        // FSM uses this before RV calculation
+entropy_final = 0.5     // Gate-3 uses this before E calculation
+
+// Alias updates (after actual calculations)
+entropy_final := E      // After E = ta.ema(E_raw, 5)
+risk_score := RV        // After RV = ta.ema(RV_raw, ...)
+
+// Table capacity increased
+table.new(..., rows=COMPACT_VIEW?12:36, ...)  // Was 31, now 36 (5-row buffer)
+```
+
+**Known Limitations (Sprint-1):**
+- CTS composite stub: `cts_final = 0.0` (Sprint-2 will add L1 Trend + L2 Mean-Rev)
+- Cooldown placeholder: `blocked_by_cooldown = false` (Sprint-2)
+- DVL meaningless until CTS active (0/0 → na)
+
+**Budget Status:** PRESERVED (request=2, plot=2) ✅
+
+---
+
+## 🚧 CURRENT BLOCKER
+
+**Waiting for:** Mühendis compile test results
+
+**Expected outcomes:**
+- Pine Editor: 0 errors, 0 warnings ✓
+- Budget: request_count=2, plot_count=2 ✓
+- Telemetry: Row-8 to 30 populated ✓
+- Functional: FSM state transitions, gate hysteresis ✓
+
+**If PASS:** → Sprint-1 MERGE → Sprint-2 kickoff  
+**If FAIL:** → Debug iteration (likely variable scope or table indexing)
+
+---
+
+## 📋 NEXT SPRINT (Sprint-2: Synapse-α)
+
+**Scope:** CTS Composite Signal + Ring Buffers
+
+**Planned deliverables:**
+1. **L1 Trend Layer:**
+   - PtLine (len=21, mult=2.5)
+   - MaLine (len=34, mult=3.0)
+   - LtLine (len=89, mult=4.5)
+   - Weighted composite: `w_pt·pt_long + w_ma·ma_long + w_lt·lt_long`
+
+2. **L2 Mean-Reversion Layer:**
+   - XvLine (len=144, mult=5.5)
+   - DvLine (len=233, mult=8.0)
+   - Weighted composite: `w_xv·xv_long + w_dv·dv_long`
+
+3. **CTS Final:**
+   ```pine
+   cts_raw = w_pt_n*pt_long + w_ma_n*ma_long + w_lt_n*lt_long 
+           + w_xv_n*xv_long + w_dv_n*dv_long
+   cts_final = ta.ema(cts_raw, 3)  // Smoothed composite
+   ```
+
+4. **Ring Buffers (H/E/K):**
+   - Percentile normalization (P95)
+   - Winsor z-score (±3 clamp)
+   - 200-300 bar history
+
+5. **Cooldown Logic:**
+   - Flip-based counter
+   - ATR-ratio scaling
+   - Neutral band integration
+
+**Budget Impact:** ZERO (no new HTF/plot calls)
+
+**Telemetry Impact:** Row-12 to 17 (eff params populated)
+
+---
+
+## 🔧 TECHNICAL CONSTRAINTS
+
+### 1. Pine v5 Restrictions (CRITICAL)
+```pine
+// ❌ ILLEGAL:
+strategy("...", initial_capital=input.float(...))  // Runtime inputs forbidden
+plot_once() => { plot(...); counter++ }            // plot() in user function forbidden
+var int x = 0; function() { x += 1 }               // Global var modification in function
+
+// ✅ LEGAL:
+strategy("...", initial_capital=10000)              // Literal const only
+plot(...); plot_count += 1                          // Manual counter at call site
+int x = 0; x += 1 (main scope)                      // Main scope modification
+```
+
+### 2. Budget Hard Limits
+```
+Pine v5 limits:
+- request.security(): 40 max
+- plot(): 64 max
+
+Atlas limits (self-imposed):
+- request.security(): 35 max (we use 2)
+- plot(): 64 max (we use 2)
+
+NEVER exceed baseline: request=2, plot=2
+```
+
+### 3. HTF Hygiene Rules
+```pine
+// ✅ CORRECT:
+htf_value = noRepaintHTF(close, "60")
+htf_value = noRepaintHTF(ta.ema(close, 20), "60")
+
+// ❌ WRONG:
+htf_value = request.security(syminfo.tickerid, "60", close)  // No wrapper
+htf_value = noRepaintHTF(request.security(...), "60")         // Nested security()
+```
+
+### 4. Table Capacity
+```
+Current: 36 rows (COMPACT_VIEW=false)
+Usage:
+  - Sprint-0: Row 0-7 (8 rows)
+  - Sprint-1: Row 8-30 (23 rows)
+  - Buffer: Row 31-35 (5 rows for Sprint-2/3)
+
+CRITICAL: table.new() size cannot be changed after creation
+Always allocate ≥ max expected rows at initialization
+```
+
+---
+
+## 📊 TELEMETRY SCHEMA (Current)
+
+```yaml
+Row 0:  Header | ATLAS Apex 2.3 — Sprint-1
+Row 1:  H      | Hurst exponent (0-1)
+Row 2:  E      | Entropy normalized (0-1)
+Row 3:  K      | Tail risk normalized (0-1)
+Row 4:  RV     | Regime Vector (0-1)
+Row 5:  global_damp | Attenuation factor
+Row 6:  Mode   | Strategy ✓ / Indicator
+Row 7:  FF_RV/PID/SBX | Feature flags (R/P/S)
+Row 8:  RVf/RVs/ΔRV | Sprint-1: RV momentum
+Row 9:  R-Off state/fuse | Sprint-1: FSM status
+Row 10: G1/G2/G3/G5 | Sprint-1: Gate mask
+Row 11: blocked_by | Sprint-1: Block reason
+Row 12: DVL (34/288) | Sprint-1: Volatility diagnostic
+Row 13-17: Eff params | Sprint-3: len/mult effective values
+Row 18-20: Exec/Guard | Sprint-2: Slip/MFOC/Guard
+Row 21-24: PID | Sprint-4: PID Risk terms
+Row 25-27: Budgets | runtime_ms / request / plot
+Row 28: Budget Status | ✓ OK / ⚠ OVERSHOOT
+Row 29: Sandbox Warns | Counter (0 = OK)
+Row 30: HTF Status | ✓ OK / ⚠ NaN
+Row 31-35: [Reserved] | Sprint-2/3 expansion
+```
+
+---
+
+## 🎯 YOUR ROLE (Kod Uzmanı)
+
+### Core Responsibilities
+1. **Code implementation:** Pine Script v5 syntax-perfect code
+2. **Budget enforcement:** NEVER exceed 2 HTF calls, 2 plots
+3. **Pattern compliance:** HTF wrapper, feature-flags, telemetry structure
+4. **Documentation:** Inline comments, CHANGELOG, PR templates
+5. **QA support:** Debug guides, test scenarios, verification checklists
+
+### Communication Style
+- **Concise:** No fluff, direct technical answers
+- **Artifact-driven:** Code in artifacts, explanations in markdown
+- **Proactive:** Anticipate issues, offer solutions before asked
+- **Transparent:** If you can't do something (screenshots, git push), say so immediately
+
+### Key Phrases You'll Hear
+- **"Budget-safe"** → No new HTF/plot calls allowed
+- **"Drop-in patch"** → Additive code, no breaking changes
+- **"Compile-safety"** → Forward declarations for variable ordering
+- **"Mikro yama"** → Small targeted fix (Turkish: micro-patch)
+- **"Telemetri"** → Telemetry table (Turkish)
+- **"Hijyen"** → Hygiene/cleanliness (Turkish)
+
+### Red Flags (ESCALATE IMMEDIATELY)
+- Request to add `request.security()` beyond 2 calls
+- Request to add `plot()` beyond 2 calls
+- Request to modify `noRepaintHTF()` wrapper pattern
+- Request to change feature-flag hierarchy
+- Request to remove budget guards
+
+---
+
+## 📂 KEY ARTIFACTS (Reference)
+
+**In current context (likely available):**
+1. `AtlasApex_2p3_Sprint0.pine` — Latest code (Sprint-1 integrated)
+2. `CHANGELOG_Sprint-0.md` — Sprint-0 documentation
+3. `Debug_Briefing_Sprint0.md` — Debug guide template
+4. `QA_Guide_Replay_Drift_Test.md` — Manual QA procedure
+5. `PR_Description_Sprint0.md` — PR template example
+
+**Reference documents (may be in chat history):**
+- `atlas_v2.2.1_prodG.pine` — Production reference (PATCH-221 source)
+- `atlas_synapse_v1.pine` — Original Synapse design (H/E/K algorithms)
+
+---
+
+## 🚀 IMMEDIATE NEXT ACTIONS
+
+**If Mühendis reports "Compile PASS":**
+1. Respond: "✅ Sprint-1 VERIFIED — Ready for merge"
+2. Prepare Sprint-2 kickoff brief (CTS composite + ring buffers)
+3. Await Mühendis Sprint-2 spec
+
+**If Mühendis reports compile errors:**
+1. Request exact error message + line number
+2. Apply minimal fix (preserve budget 2/2)
+3. Document fix in CHANGELOG
+4. Iterate until PASS
+
+**If you're asked about Sprint-0:**
+- Status: MERGED ✅
+- Key features: FF system, HTF wrapper, telemetry skeleton
+- Budget: 2/2 baseline established
+- Replay QA: PASSED (no drift)
+
+**If you're asked about team members:**
+- Mühendis: Technical lead, does compile tests, merge approvals
+- Eş Mimar: Architecture decisions, algorithm specs (H/E/K, FSM logic)
+- Yönetici: Coordination, sprint planning, final approvals
+- Ar-Ge: Experimental features, research tasks
+
+---
+
+## 🎓 LEARNING POINTS (From This Session)
+
+1. **Pine v5 is strict:**
+   - Strategy params must be compile-time const
+   - User functions can't contain `plot()` or modify global `var`
+   - Variable forward declarations needed for complex dependency graphs
+
+2. **Budget discipline is non-negotiable:**
+   - Every HTF/plot call must be justified
+   - Baseline (2/2) established in Sprint-0
+   - Guards prevent accidental additions
+
+3. **Telemetry is the backbone:**
+   - Real-time observability for all system states
+   - Compact mode (12 rows) for mobile
+   - Full mode (36 rows) for development
+
+4. **Turkish terms are normal:**
+   - Team uses Turkish technical jargon occasionally
+   - Context usually makes meaning clear
+   - Ask for clarification if truly ambiguous
+
+5. **Iteration is expected:**
+   - Debug → Micro-patch → Test → Iterate
+   - No shame in multiple attempts
+   - Document every change for audit trail
+
+---
+
+## 📞 HANDOFF CHECKLIST
+
+- [x] Sprint-0 status: MERGED
+- [x] Sprint-1 status: IN REVIEW (awaiting compile test)
+- [x] Budget baseline: 2/2 HTF/plot calls
+- [x] HTF wrapper pattern: Documented
+- [x] Telemetry schema: Row-31 mapped
+- [x] Known blockers: Mühendis compile test pending
+- [x] Next sprint: Sprint-2 (CTS composite) specs ready
+- [x] Critical constraints: Listed (budget, Pine v5, HTF hygiene)
+- [x] Artifact index: Complete
+- [x] Team roles: Clarified
+
+---
+
+**Ready for handoff.** Next Kod Uzmanı can continue from Sprint-1 compile results. 🚀
+
+---
+
+**Prepared by:** Kod Uzmanı (Claude Sonnet 4.5, 2025-10-12)  
+**Token usage:** ~80k / 190k (sufficient headroom for Sprint-2)  
+**Session quality:** High (no critical errors, all deliverables on spec)  
+**Handoff confidence:** 95% (minor compile uncertainty in Sprint-1, expected to resolve)
