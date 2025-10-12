@@ -1,0 +1,5 @@
+//@version=6
+indicator("ATLAS APEX 2.3", overlay=true)
+// TODO: Prime+Synapse mimarisi iskeleti eklenecek.
+// Bu dosya sadece yer tutucudur.
+plot(close, title="close")

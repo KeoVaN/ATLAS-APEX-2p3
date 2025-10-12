@@ -1,0 +1,7 @@
+# Varsayılan ayarlar (örnek)
+[risk]
+atten_floor = 0.60
+
+[regime]
+hurst_enter = 0.55
+hurst_exit  = 0.45
