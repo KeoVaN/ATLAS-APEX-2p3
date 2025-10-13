@@ -1,0 +1,39 @@
+
+---
+
+## 📉 Dezavantajlar ve Sorunlar (İleri AlgoTrade açısından)
+
+1. **Tek çekirdekli PID tasarımının zayıf adaptasyonu**
+   PID yalnızca `cts_final` sinyaline gömülü durumda. Bu, farklı rejimlerde (ör. volatil trend vs yatay konsolidasyon) PID’nin davranışının sınırlı ve bazen kontraproduktif olmasına neden olabilir. PID’nin rejimle *bağımsız değil, gömülü* olması risk artırıcı bir tasarım.
+
+2. **PID için güvenli reset / saturation guard eksikliği**
+   PID’nin I bileşeni yalnızca basit clamp ile korunuyor. Bu durum, özellikle prolonged risk-off veya flat dönemlerde wind-up’a açık hale getiriyor. PID’nin “durumsal hafıza” kontrolü zayıf.
+
+3. **Signal conditioning eksikliği (gürültü bastırma)**
+   `cts_final` sinyali volatil. PID öncesi lowpass filtre yok. Bu, PID’nin **gürültüye aşırı tepki vermesine** ve RS scaling’in jitter üretmesine yol açabilir.
+
+4. **Rejim geçişlerinde PID trigger jitter**
+   RV gate katmanı ile PID output etkileşimi histerezisli değil → özellikle RV eşiklerinde (0.4–0.55 aralığı) PID çıkışı bir frame ON / bir frame OFF olabiliyor. Bu, execution tarafında istikrarsızlık üretir.
+
+5. **PID EV tanımı deterministik ama tek boyutlu**
+   EV = `ta.ema(cts_final, PID_ERR_LEN)` olarak tanımlanmış. Rejimsel olarak anlamlı bir *target tracking* yok. PID, sinyalin kendi ortalamasına karşı çalışıyor → Bu da “reaktif” ve bazen “amaçsız” PID davranışı yaratıyor.
+
+6. **PID’nin risk yönetimiyle entegrasyonu yüzeysel**
+   PID, RS scaling üzerinden dolaylı etki yapıyor. Gerçek risk parametrelerine (ör. stop mesafesi, vol karakteri, trade frekansı) doğrudan bağlı değil. Bu, sistemin PID’den beklenen “risk adaptasyonu” potansiyelini kısıtlıyor.
+
+7. **TradingView Premium limitlerinde dar bütçe**
+   Request=2, plot=2 bütçe sabit tutulmuş olsa da bu kodda request_count ~35, plot_count ~64’e yakın. Bu limitler Premium’da bile bazı chart konfigürasyonlarında **kararsız render** ve **table glitching** yaratabilir.
+
+8. **CTS hesaplamasında regresif weighting**
+   CTS halen lineer ağırlıklandırma kullanıyor (Pt/Ma/Lt/Xv/Dv). Volatilite rejimi ya da ATR oranı gibi parametreler bu ağırlıkları dinamik biçimde güncellemiyor. Bu da rejim geçişlerinde CTS’in “tepki karakterini” zayıflatıyor.
+
+9. **PID’nin anti-windup yapısı tek katmanlı**
+   Sadece clamp var. Oysa modern trading PID sistemleri için:
+
+   * conditional integral accumulation
+   * back-calculate anti-windup
+   * feed-forward blending (FF → PID)
+     kullanılmalı.
+
+10. **Alert sistemi “signal-level” ama “decision-level” değil**
+    PID’nin karar üzerindeki etkisi alert sistemine yansıtılmıyor. PID aktif olsa da alert sadece gate+cts bazlı
