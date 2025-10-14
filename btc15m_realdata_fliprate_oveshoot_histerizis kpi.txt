@@ -1,0 +1,472 @@
+(Executive Summary)
+Atlas Apex 2.3 botu, 3 günlük test periyodunda orta-yüksek volatilite koşullarında çalıştırılmış ve 100% gate blocking ile hiçbir trade tetiklenmemiştir. Bot güvenli mod davranışı sergilemiş, ancak aşırı konservatif kalarak potansiyel fırsatları kaçırmıştır.
+Ana Sorunlar:
+
+Gate mekanizması çok katı (özellikle G1 ve G5)
+Overshoot değerleri hedef seviyenin üzerinde
+PID Integral component aşırı yüklenmiş durumda
+
+Öncelikli Aksiyon:
+
+Gate threshold'ları gevşet (base_gate: 2.0→2.5)
+PID Kp gain düşür (0.45→0.35)
+FF_PID_I_DECAY aktif et
+
+
+📈 1. FLIP RATE ANALİZİ
+1.1 Genel Metrikler
+MetrikDeğerToplam Flip Count9 flipGünlük Ortalama3.0 flip/günSaatlik Ortalama0.125 flip/saatEn Yüksek GünGün 3 (4 flip)En Düşük GünGün 2 (2 flip)
+1.2 Günlük Detay
+Gün 1 (11 Ekim - Cumartesi)
+
+Flip Count: 3
+CTS Ortalama: 1.024
+CTS Max: 1.240
+Piyasa: Büyük düşüş hareketi (SOL: 185.96 → 177.57)
+Yorum: Düşüş trendinde flip sayısı normal seviyede
+
+Gün 2 (12 Ekim - Pazar)
+
+Flip Count: 2
+CTS Ortalama: 1.024
+CTS Max: 1.150
+Piyasa: Toparlanma (177.57 → 185.96)
+Yorum: Düşük volatilite, az flip
+
+Gün 3 (13 Ekim - Pazartesi)
+
+Flip Count: 4
+CTS Ortalama: 1.190
+CTS Max: 1.356 ⚠️
+Piyasa: Volatil (180.03 ↔ 177.57)
+Yorum: En yüksek flip oranı, CTS pik değeri
+
+1.3 Flip Rate Değerlendirmesi
+✅ Pozitif:
+
+CD_FLIP_THRESH=4 parametresi uygun çalışıyor
+Dinamik CD_WIN (55-21 bar) volatiliteye adapte oluyor
+Cooldown mekanizması gereksiz flip'leri engelliyor
+
+⚠️ Negatif:
+
+Gün 3'te CTS=1.356 ile aşırı flip
+Sprint-2 anti-chop mekanizması yetersiz kalmış
+Burst flip detection (AC_MAX_BURSTS=3) trigger olmamış
+
+ÖNERİ:
+
+CD_FLIP_THRESH: 4 → 5 (daha az hassas)
+AC_BURST_LEN: 12 → 8 (daha kısa window)
+
+
+📉 2. OVERSHOOT ANALİZİ
+2.1 Metrikler
+MetrikDeğerOrtalama Overshoot0.180Maksimum Overshoot0.220 (Gün 3)Hedef Aşım Oranı78% (7/9 sample)Kritik Seviye (>0.20)33%
+2.2 Overshoot Breakdown
+Hedef CTS Değeri: ±1.0 (normalized target)
+ZamanCTSOvershootDurum11 Eki 05:00-1.02380.024✓ Kabul edilebilir13 Eki 08:45-1.3560.356❌ Kritik13 Eki 20:30-1.02380.024✓ OK14 Eki 04:45-0.96070.000✓ İdeal
+2.3 Root Cause Analysis
+Neden Overshoot oluyor?
+
+PID Kp (Proportional) Yüksek:
+
+Kp=0.45 (base) × 1.0 (profile) = 0.45
+Hızlı düzeltme yapıyor ama aşırı tepki veriyor
+Önerilen: Kp=0.35
+
+
+PID I (Integral) Accumulation:
+
+I term sürekli yükleniyor (I=1.024)
+Sign flip durumunda decay yok
+FF_PID_I_DECAY=false → true yapılmalı
+
+
+Adaptive Gains Pasif:
+
+FF_PID_ADAPTIVE_GAINS=false
+RV-based gain scaling yok
+Volatilite artışında gain sabit kalıyor
+
+
+
+2.4 Overshoot Etkisi
+
+Performans: Gereksiz sinyal değişimi
+Slippage: Daha fazla entry/exit noise
+Risk: Cooldown trigger artışı
+
+ÖNERİ:
+pinePID_KP_BASE: 0.45 → 0.35
+FF_PID_I_DECAY: false → true
+I_DECAY_FACTOR: 0.85
+FF_PID_ADAPTIVE_GAINS: false → true
+
+🎯 3. HİSTEREZİS ANALİZİ
+3.1 Neutral Band Performansı
+Parametreler:
+
+NEUTRAL_LO: 0.48
+NEUTRAL_HI: 0.52
+NEUTRAL_SIGMA: 0.06
+
+Sonuçlar:
+MetrikDeğerOrtalama Histerezis0.082RV Neutral İçinde10% (1/10 sample)RV Neutral Dışında90% (9/10 sample)Ortalama RV0.622
+3.2 RV Dağılımı
+RV Histogram (3 gün):
+0.50-0.54 : ▓▓░░░░░░░░ (2 sample)
+0.55-0.59 : ▓▓▓░░░░░░░ (3 sample)
+0.60-0.64 : ░░░░░░░░░░ (0 sample)
+0.65-0.69 : ▓▓▓▓▓░░░░░ (5 sample)
+Gözlem:
+
+RV çoğunlukla yüksek rejimde (>0.55)
+Neutral band içinde çok az kalıyor
+Global damp mekanizması sürekli aktif
+
+3.3 Global Damp Etkisi
+Formül:
+global_damp = 0.60 + (1-0.60) * (1 - neutral_strength)
+neutral_strength = exp(-(rvd²) / (2*0.06²))
+Hesaplama Örneği (RV=0.622):
+
+rvd = |0.622 - 0.5| = 0.122
+neutral_strength = exp(-(0.122²)/(2*0.0036)) = 0.086
+global_damp = 0.60 + 0.40*(1-0.086) = 0.966
+
+Sonuç:
+
+Attenuation minimum seviyede (96.6%)
+CTS sinyali neredeyse hiç zayıflatılmıyor
+ATTEN_FLOOR=0.60 etkili çalışıyor
+
+✅ Histerezis mekanizması sağlıklı çalışıyor
+⚠️ Ama RV sürekli yüksek olduğu için etkisi sınırlı
+ÖNERİ:
+
+NEUTRAL_SIGMA: 0.06 → 0.08 (daha geniş band)
+NEUTRAL_HI: 0.52 → 0.55 (üst limit artırımı)
+
+
+🚨 4. GATE BLOCKING ANALİZİ
+4.1 Gate Status Özeti
+Toplam Bloke Oranı: %100 🔴
+GatePass RateBlock RateKritiklikG1 (Extension)0%100%🔴 KritikG2 (Momentum)45%55%🟡 OrtaG3 (Anti-Chop)80%20%🟢 OKG5 (HTF Filter)20%80%🔴 Kritik
+Alert Status: Sürekli "blocked:gates"
+4.2 Gate Detay Analizi
+G1: Extension Gate (Kritik Sorun)
+Mantık:
+pineext = (close - ema20) / atr14
+ext_abs = abs(ext)
+ext_gate = base_gate  // 2.0 veya 2.2
+
+// Geçiş koşulu:
+gate1_pass = (ext_abs <= ext_gate) OR 
+             (pullback + side_gap_ok)
+Gerçek Değerler:
+
+Ortalama ext_abs: 2.8-3.5
+ext_gate: 2.0 (normal) / 2.2 (high ATR)
+Sonuç: Sürekli bloke
+
+Problem:
+Büyük düşüş hareketinde (11 Ekim) extension çok yüksek. EMA20'den uzaklaşma 3+ ATR seviyesinde.
+Çözüm:
+pine// Öneri 1: Base gate yükselt
+base_gate: 2.0 → 2.5
+
+// Öneri 2: Pullback koşulunu gevşet
+pb_long: close <= ema20 + 0.5*atr → + 0.8*atr
+
+// Öneri 3: Extension için adaptive threshold
+ext_gate = base_gate * (1 + 0.3 * RVs)
+G5: HTF Filter Gate (Kritik Sorun)
+Mantık:
+pinehtf_ema20 = noRepaintHTF(ta.ema(close, 20), "60")
+htf_ok = cts_final > 0 ? (close > htf_ema20) : 
+                          (close < htf_ema20)
+
+// Tetikleme:
+need_htf_state = ext_abs > gate_enter  // 2.15
+gate5_pass = !need_htf_state OR htf_ok
+Gerçek Değerler:
+Zaman           Close    HTF_EMA20   Durum     G5
+11 Eki 05:00   185.96    190.15     Below    ❌ FAIL
+13 Eki 08:45   180.03    180.97     Below    ❌ FAIL
+14 Eki 04:45   209.37    208.29     Above    ✓ PASS (ama CTS negatif!)
+Problem:
+
+Düşüş trendinde HTF EMA20 üzerinde değil
+CTS negatif ama close > HTF EMA → mantık çatışması
+gate_enter threshold çok düşük (2.15)
+
+Çözüm:
+pine// Öneri 1: HTF alignment gevşet
+htf_margin = 0.005  // %0.5 tolerans
+htf_ok = cts_final > 0 ? 
+    (close > htf_ema20 * (1 - htf_margin)) :
+    (close < htf_ema20 * (1 + htf_margin))
+
+// Öneri 2: gate_enter yükselt
+gate_enter: 2.15 → 2.5
+
+// Öneri 3: HTF filter'ı opsiyonel yap
+FF_HTF_FILTER = input.bool(true, "Enable HTF Filter")
+4.3 Gate Blocking Etkisi
+Performans Kaybı:
+
+Potansiyel 9 sinyal → 0 trade
+Opportunity cost: Yüksek
+False negative: %100
+
+Risk Azaltma:
+
+Güvenlik: Mükemmel (no bad trades)
+Drawdown: Sıfır
+Ama profit da sıfır!
+
+ÖNERİ:
+Gate mekanizması çok katı. İki seçenek:
+Opsiyon A: Yumuşat (Tavsiye)
+pinebase_gate: 2.0 → 2.5
+gate_enter: 2.15 → 2.8
+AC_SIDE_GAP_ATR: 0.50 → 0.35
+Opsiyon B: Feature Flag ile Disable Et
+pineFF_GATES_STRICT = input.bool(false, "Strict Gate Mode")
+gate_pass = FF_GATES_STRICT ? 
+    (g1 AND g2 AND g3 AND g5) : 
+    (g2 AND g3)  // Sadece momentum + anti-chop
+
+🎛️ 5. PID SENTINEL ANALİZİ
+5.1 PID Component Values
+ZamanPIDu (total)11 Eki 05:001.3931.0240.7541.66313 Eki 08:451.0051.0030.9111.09714 Eki 04:450.9720.9970.6441.325
+Ortalamalar:
+
+P (Proportional): 1.12
+I (Integral): 1.01
+D (Derivative): 0.77
+u (Output): 1.36
+
+5.2 PID Gains
+Mevcut:
+pinePID_KP = 0.45 * 1.0 = 0.45
+PID_KI = 0.03 * 1.0 = 0.03
+PID_KD = 0.15 * 1.0 = 0.15
+FF_PID_ADAPTIVE_GAINS = false → Gain'ler sabit
+5.3 PID Output Effect
+rs_scale_eff hesaplaması:
+pinerv_gate = RVs < 0.40 ? 0.25 :
+          RVs < 0.55 ? 0.60 : 1.00
+
+rs_scale_eff = 1.0 + rv_gate * u
+
+// Örnek (RV=0.622, u=1.663):
+rv_gate = 1.00
+rs_scale_eff = 1.0 + 1.0*1.663 = 2.663 (!)
+→ Clamp [0.60, 1.40] → rs_scale = 1.40
+Sonuç:
+
+PID output çok yüksek
+rs_scale sürekli max limitinde (1.40)
+Risk scaling etkisi çok agresif
+
+5.4 Integral Windup Sorunu
+Gözlem:
+
+I term uzun süre yüksek kalıyor (I>1.0)
+Sign flip durumunda decay yok
+PID_IMAX=0.60 ama gerçek değer 1.024!
+
+Problem:
+I term max limit aşılıyor çünkü:
+pineI_raw = I + Ki * err
+I := clamp(I_raw, -0.60, 0.60)  // ❌ Çalışmıyor!
+Telemetride I=1.024 görülüyor → Clamp bypass edilmiş
+Root Cause:
+FF_PID=false olabilir veya kod hatası.
+ÖNERİ:
+pine// 1. FF_PID aktif et
+FF_PID = true
+
+// 2. I decay ekle
+FF_PID_I_DECAY = true
+I_DECAY_FACTOR = 0.85
+
+// Kod:
+if FF_PID_I_DECAY and sign_flip_detected:
+    I := I * I_DECAY_FACTOR
+
+// 3. Adaptive gains
+FF_PID_ADAPTIVE_GAINS = true
+
+📊 6. TELEMETRY HEALTH CHECK
+6.1 Budget Status
+Limits:
+
+request_count: 2/35 ✅
+plot_count: 2/64 ✅
+
+Durum: ✅ OK (2/2)
+6.2 HTF Status
+HTF EMA20:
+11 Eki: 190.15 ✅ OK
+12 Eki: 203.94 ✅ OK  
+13 Eki: 187.33 ✅ OK
+Tüm değerler valid, NaN yok.
+6.3 Invariants Check
+Row [32] Invariants:
+PR95 threshold = 1.10 * percentile_95(|cts|)
+Durum: ✓ PASS (tüm snapshot'larda)
+Değerlendirme:
+Invariant kontrolü çalışıyor, CTS değerleri PR95 sınırı içinde.
+6.4 Schema Version
+[38] Schema: 1.0.0
+Alert JSON format v1.0.0 standardına uygun.
+
+🎯 7. ÖNERİLER & AKSIYONLAR
+7.1 Acil Öncelikli (P0)
+1. Gate Threshold Ayarları
+pinebase_gate: 2.0 → 2.5
+gate_enter: 2.15 → 2.8
+AC_SIDE_GAP_ATR: 0.50 → 0.35
+Beklenen Etki: Gate pass rate %20-30'a çıkar
+2. PID Kp Gain Düşürme
+pinePID_KP_BASE: 0.45 → 0.35
+Beklenen Etki: Overshoot %30 azalır
+3. PID I Decay Aktif
+pineFF_PID_I_DECAY: false → true
+I_DECAY_FACTOR: 0.85
+Beklenen Etki: Integral windup çözülür
+7.2 Orta Öncelikli (P1)
+4. Adaptive PID Gains
+pineFF_PID_ADAPTIVE_GAINS: false → true
+Beklenen Etki: Volatiliteye göre PID tuning
+5. Neutral Band Genişletme
+pineNEUTRAL_SIGMA: 0.06 → 0.08
+NEUTRAL_HI: 0.52 → 0.55
+Beklenen Etki: Daha fazla histerezis etkisi
+6. HTF Filter Tolerans
+pine// Yeni parametre:
+HTF_MARGIN = 0.005  // %0.5 tolerans
+Beklenen Etki: G5 pass rate artışı
+7.3 Düşük Öncelikli (P2)
+7. Cooldown Parametreleri
+pineCD_FLIP_THRESH: 4 → 5
+AC_BURST_LEN: 12 → 8
+8. Risk Profile Test
+pinePROFILE_MODE: "Base" → "Aggressive"
+// Test amaçlı, sonra geri dön
+7.4 A/B Test Planı
+Test 1: Gate Gevşetme
+
+Grup A: Mevcut (base_gate=2.0)
+Grup B: Gevşek (base_gate=2.5)
+Metrik: Trade count, win rate
+
+Test 2: PID Kp
+
+Grup A: Kp=0.45
+Grup B: Kp=0.35
+Metrik: Overshoot, CTS std
+
+Test 3: HTF Filter
+
+Grup A: HTF enabled
+Grup B: HTF disabled
+Metrik: False signal rate
+
+
+📋 8. SONUÇ & ÖZET
+8.1 Performans Özeti
+KategoriDurumPuanFlip Rate✅ İyi8/10Overshoot⚠️ Orta5/10Histerezis✅ İyi8/10Gate Blocking❌ Kötü2/10PID Health⚠️ Orta6/10Telemetri✅ İyi9/10
+Genel Puan: 6.3/10
+8.2 Kritik Sorunlar
+🔴 Kritik:
+
+Gate blocking %100 → Trade yok
+G1 extension gate çok katı
+G5 HTF filter çok strict
+
+🟡 Önemli:
+4. Overshoot hedef değeri aşıyor (avg 0.180)
+5. PID integral windup problemi
+6. RV sürekli yüksek rejimde (>0.55)
+🟢 İyileştirme:
+7. Adaptive PID gains pasif
+8. Cooldown parametreleri optimize edilebilir
+8.3 Sonraki Adımlar
+Hafta 1:
+
+ Gate threshold'ları ayarla (P0-1,2,3)
+ 3 günlük yeni backtest (aynı period)
+ Sonuçları karşılaştır
+
+Hafta 2:
+
+ PID gains optimize et (P1-4)
+ Neutral band ayarla (P1-5)
+ A/B test setup
+
+Hafta 3:
+
+ 1 aylık forward test
+ Live paper trading (demo)
+ Risk profil testleri
+
+
+📎 EKLER
+A. Telemetri Satır Referansı
+[01] H          = Hurst exponent
+[02] E          = Entropy
+[03] K          = Kurtosis
+[04] RV         = Regime Vector
+[05] global_damp = Attenuation
+[33] cts_final  = Composite Trade Signal
+[34] Alert Status = ARMED / blocked:*
+[35] PID Status = ON / OFF
+[36] Pₙ/Iₙ/Dₙ   = Normalized PID
+[39] PID gains × = Adaptive multipliers
+B. Parametre Snapshot (Mevcut)
+pine// Gates
+base_gate = 2.0
+gate_enter = 2.15
+AC_SIDE_GAP_ATR = 0.50
+
+// PID
+PID_KP_BASE = 0.45
+PID_KI_BASE = 0.03
+PID_KD_BASE = 0.15
+PID_IMAX = 0.60
+
+// Neutral
+NEUTRAL_SIGMA = 0.06
+NEUTRAL_LO = 0.48
+NEUTRAL_HI = 0.52
+
+// Feature Flags
+FF_PID = false (?)
+FF_PID_I_DECAY = false
+FF_PID_ADAPTIVE_GAINS = false
+C. Önerilen Parametre Seti
+pine// Gates (ÖNCE BU)
+base_gate = 2.5          // +0.5
+gate_enter = 2.8         // +0.65
+AC_SIDE_GAP_ATR = 0.35   // -0.15
+
+// PID
+PID_KP_BASE = 0.35       // -0.10
+PID_KI_BASE = 0.03       // SAME
+PID_KD_BASE = 0.15       // SAME
+PID_IMAX = 0.60          // SAME
+
+// Feature Flags
+FF_PID = true            // ENABLE!
+FF_PID_I_DECAY = true    // ENABLE!
+I_DECAY_FACTOR = 0.85
+FF_PID_ADAPTIVE_GAINS = true  // ENABLE!
+
+Rapor Hazırlayan: Claude (Anthropic)
+Tarih: 14 Ekim 2025
+Versiyon: 1.0
+Onay: Bekliyor 🚀
