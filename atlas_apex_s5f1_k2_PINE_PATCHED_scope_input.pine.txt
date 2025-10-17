@@ -1,0 +1,849 @@
+//@version=5
+// ============================================================================
+// Atlas Apex 2.3 — Sprint-5 Faz-1.1 (Soft) k2
+// Build: S5-F1.1-soft-k2
+// CURRENT: Anti-windup (DECAY+DRAIN) + RV-aware gates + Profile invariants
+// REVISION: I_DRAIN delta-check + risk_off guard, event per-bar semantics
+// PATCH: RVG Canary (SOL/ETH only)
+// ============================================================================
+
+// ============================= FEATURE FLAGS =============================
+FF_GROUP = "Feature Flags"
+ORDERS_ENABLED = input.bool(false, "Enable Order Execution", group=FF_GROUP)
+QTY_GATE = input.float(0.0, "Quantity Gate (0-1)", 0.0, 1.0, 0.05, group=FF_GROUP)
+FF_RV  = input.bool(true,  "FF: Regime Vector", group=FF_GROUP)
+FF_PID = input.bool(true, "FF: PID Risk", group=FF_GROUP)
+FF_SANDBOX = input.bool(true, "FF: Sandbox Mode", group=FF_GROUP)
+FF_RV_NL = input.bool(true, "FF: RV Non-Linear (tanh)", group=FF_GROUP)
+
+groupS5 = "Sprint-5"
+FF_PID_NORM_TELEM = input.bool(true, "FF: PID Normalized Telem", group=groupS5)
+FF_BUDGET_STRICT = input.bool(true, "FF: Budget Strict Alert", group=groupS5)
+FF_PROFILE = input.bool(true, "FF: Risk Profile Presets", group=groupS5)
+FF_PID_ADAPTIVE_GAINS = input.bool(true, "FF: PID Adaptive Gains", group=groupS5)
+FF_PID_I_DECAY = input.bool(false, "FF: PID I Decay (P flip)", group=groupS5)
+FF_PID_I_DRAIN_MIDRV = input.bool(false, "FF: PID I Drain (mid-RV)", group=groupS5)
+FF_RV_AWARE_GATES = input.bool(true, "FF: RV-Aware Gates (Canary)", group=groupS5)
+
+// Canary sembol listesi (CSV), örnek: "SOLUSDT,ETHUSDT"
+CANARY_CSV = input.string("SOLUSDT,ETHUSDT", "RVG Canary Symbols (CSV)", group=groupS5)
+
+I_DECAY_FACTOR = input.float(0.85, "I Decay Factor", 0.70, 0.95, 0.05, group=groupS5)
+I_DRAIN_RATE = input.float(0.02, "I Drain Rate", 0.005, 0.05, 0.005, group=groupS5)
+
+// ============================= PATCH: RVG CANARY SCOPE (CSV-driven) =============================
+symU = str.upper(syminfo.ticker)
+// Boşlukları at, baş/sonuna virgül ekleyip "tam eşleşme" kontrolü yap
+tmp = str.replace(CANARY_CSV, " ", "")
+csvU = "," + str.upper(tmp) + ","
+in_canary = str.contains(csvU, "," + symU + ",")
+
+// FF'yi scope ile daralt
+FF_RVG_ON = FF_RV_AWARE_GATES and in_canary
+// ============================= END PATCH =============================
+
+groupProfile = "Risk Profile"
+PROFILE_MODE = input.string("Base", "Profile", options=["Base","Aggressive","Defensive"], group=groupProfile)
+
+MODE_GROUP = "Mode"
+INDICATOR_MODE = input.bool(true, "Indicator Mode", group=MODE_GROUP)
+
+strategy("Atlas Apex 2.3 — Sprint-5 Faz-1.1", overlay=true,
+     initial_capital=10000,
+     commission_type=strategy.commission.percent,
+     commission_value=0.075,
+     slippage=2,
+     pyramiding=0,
+     calc_on_order_fills=true,
+     max_bars_back=5000)
+
+// ============================= HELPERS =============================
+clamp(v, lo, hi) => math.min(math.max(v, lo), hi)
+
+int request_count = 0
+int plot_count = 0
+float runtime_ms = na
+int sandbox_warn_count = 0
+
+BUILD_TAG = input.string("S5-F1.1-soft-k2", "Build Tag", group="Display")
+
+f_sandbox_warn(cond) => FF_SANDBOX and cond ? 1 : 0
+
+noRepaintHTF(expr, tf) =>
+    request.security(syminfo.tickerid, tf, expr[1], lookahead=barmerge.lookahead_on)
+
+htfEMA(src, len, tf) => noRepaintHTF(ta.ema(src, len), tf)
+
+var float risk_score = 0.5
+var float entropy_final = 0.5
+
+// ============================= PROFILE PRESETS =============================
+prof_kp_mult = FF_PROFILE ? (PROFILE_MODE=="Aggressive" ? 1.20 : (PROFILE_MODE=="Defensive" ? 0.85 : 1.0)) : 1.0
+prof_ki_mult = FF_PROFILE ? (PROFILE_MODE=="Aggressive" ? 1.00 : (PROFILE_MODE=="Defensive" ? 1.15 : 1.0)) : 1.0
+prof_kd_mult = FF_PROFILE ? (PROFILE_MODE=="Aggressive" ? 1.25 : (PROFILE_MODE=="Defensive" ? 0.90 : 1.0)) : 1.0
+prof_sigma = FF_PROFILE ? (PROFILE_MODE=="Aggressive" ? 0.05 : (PROFILE_MODE=="Defensive" ? 0.08 : 0.06)) : 0.06
+
+prof_bias = FF_PROFILE ? (PROFILE_MODE=="Aggressive" ? 1.05 : (PROFILE_MODE=="Defensive" ? 0.95 : 1.00)) : 1.00
+prof_cd = FF_PROFILE ? (PROFILE_MODE=="Aggressive" ? 0.95 : (PROFILE_MODE=="Defensive" ? 1.05 : 1.00)) : 1.00
+
+// ============================= DEFAULTS =============================
+HURST_HI = input.float(0.55, "Hurst High", group="Defaults")
+HURST_LO = input.float(0.45, "Hurst Low", group="Defaults")
+RV_SMOOTH_EMA = input.int(3, "RV Smooth EMA", minval=1, group="Defaults")
+
+// ============================= SPRINT-1 INPUTS =============================
+groupS1 = "Sprint-1"
+RISK_OFF_ENTER = input.float(0.95, "Risk-Off Enter", 0.80, 1.00, 0.01, group=groupS1)
+RISK_OFF_EXIT = input.float(0.85, "Risk-Off Exit", 0.70, 0.95, 0.01, group=groupS1)
+ATTEN_FLOOR = input.float(0.60, "Attenuation Floor", 0.40, 0.80, 0.05, group=groupS1)
+REL_VALVE_ENABLED = input.bool(true, "Risk-Off Early-Release", group=groupS1)
+FUSE_BARS = input.int(40, "Risk-Off Fuse (bars)", 5, 200, group=groupS1)
+
+AC_MIN_ATR_Z = input.float(0.20, "Anti-Chop: Min ATR-z", 0.00, 1.00, 0.01, group=groupS1)
+AC_SIDE_GAP_ATR = input.float(0.50, "Anti-Chop: Side-gap", 0.10, 2.00, 0.05, group=groupS1)
+AC_BURST_LEN = input.int(12, "Anti-Chop: Burst window", 4, 50, 1, group=groupS1)
+AC_MAX_BURSTS = input.int(3, "Anti-Chop: Max flips", 1, 10, 1, group=groupS1)
+
+NEUTRAL_LO = input.float(0.48, "Neutral Band Lower", 0.0, 0.5, 0.01, group=groupS1)
+NEUTRAL_HI = input.float(0.52, "Neutral Band Upper", 0.5, 1.0, 0.01, group=groupS1)
+
+// ============================= SPRINT-2 INPUTS =============================
+groupS2 = "Sprint-2"
+CD_FLIP_THRESH = input.int(4, "Cooldown Flip Threshold", 2, 20, group=groupS2)
+
+// ============================= SPRINT-3 INPUTS =============================
+groupS3 = "Sprint-3"
+NEUTRAL_SIGMA_BASE = input.float(0.06, "Neutral σ Base", minval=0.01, maxval=0.20, step=0.005, group=groupS3)
+NEUTRAL_SIGMA = FF_PROFILE ? prof_sigma : NEUTRAL_SIGMA_BASE
+
+// ============================= SPRINT-4 INPUTS (PID) =============================
+groupS4 = "Sprint-4 (PID)"
+PID_ERR_LEN = input.int(96, "PID Error Window", minval=20, maxval=200, group=groupS4)
+PID_KP_BASE = input.float(0.45, "PID Kp Base", minval=0.0, maxval=2.0, step=0.05, group=groupS4)
+PID_KI_BASE = input.float(0.03, "PID Ki Base", minval=0.0, maxval=0.50, step=0.01, group=groupS4)
+PID_KD_BASE = input.float(0.15, "PID Kd Base", minval=0.0, maxval=1.0, step=0.05, group=groupS4)
+PID_IMAX = input.float(0.60, "PID I Max", minval=0.20, maxval=1.50, step=0.10, group=groupS4)
+
+PID_KP = PID_KP_BASE * prof_kp_mult
+PID_KI = PID_KI_BASE * prof_ki_mult
+PID_KD = PID_KD_BASE * prof_kd_mult
+
+// ============================= META (H/E/K + Winsor) =============================
+ret = math.log(close/close[1])
+
+f_hurst_simple(length) =>
+    if bar_index < length
+        0.5
+    else
+        mean_ret = ta.sma(ret, length)
+        csum = 0.0, mx = 0.0, mn = 0.0
+        for i = 0 to length-1
+            csum := csum + (ret[i]-mean_ret)
+            mx := math.max(mx, csum)
+            mn := math.min(mn, csum)
+        R = mx - mn, S = ta.stdev(ret, length)
+        R>0 and S>0 ? clamp(math.log(R/S)/math.log(length*0.5), 0, 1) : 0.5
+
+H_raw = FF_RV ? f_hurst_simple(50) : 0.5
+
+H_p95 = ta.percentile_linear_interpolation(H_raw, 256, 95)
+H_p05 = ta.percentile_linear_interpolation(H_raw, 256, 5)
+H = bar_index >= 256 ? math.min(math.max(H_raw, H_p05), H_p95) : H_raw
+
+f_entropy5(src, lb) =>
+    var float[] bins = array.new_float(5, 0)
+    min_ret = ta.lowest(src, lb), max_ret = ta.highest(src, lb)
+    rng = max_ret - min_ret
+    e = 0.0
+    if rng > 0
+        for i = 0 to 4
+            array.set(bins, i, 0)
+        for i = 0 to lb-1
+            if not na(src[i])
+                idx = math.min(int((src[i]-min_ret)/rng*5), 4)
+                array.set(bins, idx, array.get(bins, idx)+1)
+        for i = 0 to 4
+            p = array.get(bins, i)/lb
+            if p>0
+                e := e - p*math.log(p)
+        e := e/math.log(5.0)
+    else
+        e := 0.5
+    e
+
+E_raw = FF_RV ? f_entropy5(ret, 100) : 0.5
+E_smooth = ta.ema(E_raw, 5)
+
+E_p95 = ta.percentile_linear_interpolation(E_smooth, 256, 95)
+E_p05 = ta.percentile_linear_interpolation(E_smooth, 256, 5)
+E = bar_index >= 256 ? math.min(math.max(E_smooth, E_p05), E_p95) : E_smooth
+entropy_final := E
+
+mu_t = ta.sma(ret, 100)
+sd_t = math.max(ta.stdev(ret, 100), 1e-8)
+z_t = (ret - mu_t)/sd_t
+K_raw = FF_RV ? ta.ema(math.abs(z_t), 5) : 0.0
+K_pr = clamp(ta.percentrank(K_raw, 200)/100.0, 0.0, 1.0)
+
+K_p95 = ta.percentile_linear_interpolation(K_pr, 256, 95)
+K_p05 = ta.percentile_linear_interpolation(K_pr, 256, 5)
+K_w = bar_index >= 256 ? math.min(math.max(K_pr, K_p05), K_p95) : K_pr
+K = math.max(K_w, 0.0)
+
+// ============================= RV + normW =============================
+wH = input.float(0.40, "wH", step=0.05, group="RV Weights")
+wE = input.float(0.35, "wE", step=0.05, group="RV Weights")
+wK = input.float(0.25, "wK", step=0.05, group="RV Weights")
+
+normW(a, b, c) =>
+    s = a + b + c
+    s_safe = math.max(s, 1e-8)
+    [a/s_safe, b/s_safe, c/s_safe]
+
+[wH_n, wE_n, wK_n] = normW(wH, wE, wK)
+
+Hn = clamp((H - 0.30)/0.40, 0, 1)
+En = clamp(E, 0, 1)
+Kn = clamp(K, 0, 1)
+RV_raw = FF_RV ? (wH_n*Hn + wE_n*(1.0 - En) + wK_n*(1.0 - Kn)) : 0.5
+RV = ta.ema(RV_raw, RV_SMOOTH_EMA)
+risk_score := RV
+
+RVs = ta.ema(RV_raw, 3)
+
+rv_fast = ta.ema(RV, 3)
+rv_slow = ta.ema(RV, 21)
+rv_mom = rv_fast - rv_slow
+
+// S5-F1.1: RV band detection
+rv_low = RVs <= 0.40
+rv_mid = RVs > 0.40 and RVs < 0.65
+rv_high = RVs >= 0.65
+rv_band_str = rv_low ? "low" : (rv_mid ? "mid" : "high")
+
+// ============================= FSM =============================
+var bool risk_off_state = false
+var int riskoff_fuse = 0
+var int ro_bars = 0
+var int rn_bars = 0
+
+_enter_th = RISK_OFF_ENTER
+_exit_th = RISK_OFF_EXIT
+
+if RV > _enter_th
+    ro_bars := ro_bars + 1
+    rn_bars := 0
+else if RV < _exit_th or rv_mom < 0
+    rn_bars := rn_bars + 1
+    ro_bars := 0
+else
+    ro_bars := 0
+    rn_bars := 0
+
+if not risk_off_state and ro_bars >= 2
+    risk_off_state := true
+    riskoff_fuse := FUSE_BARS
+else if risk_off_state
+    riskoff_fuse := math.max(riskoff_fuse - 1, 0)
+    early_release = REL_VALVE_ENABLED and riskoff_fuse == 0 and (RV < (_enter_th - 0.07)) and (rv_mom < -0.04)
+    if rn_bars >= 2 or early_release
+        risk_off_state := false
+        rn_bars := 0
+        riskoff_fuse := 0
+
+// ============================= SPRINT-3: NEUTRAL-BAND DAMP V2 =============================
+rvd = math.abs(RVs - 0.5)
+neutral_strength = math.exp(-(rvd * rvd) / (2.0 * NEUTRAL_SIGMA * NEUTRAL_SIGMA))
+global_damp = ATTEN_FLOOR + (1.0 - ATTEN_FLOOR) * (1.0 - neutral_strength)
+
+// ============================= ANTI-CHOP =============================
+atr14 = ta.atr(14)
+atr_mu50 = ta.sma(atr14, 50)
+atr_sd50 = math.max(ta.stdev(atr14, 50), 1e-8)
+atr_z = (atr14 - atr_mu50)/atr_sd50
+atr_ratio = atr14 / math.max(atr_mu50, 1e-8)
+
+// ============================= SPRINT-3: NL EFF MAPS (Synapse-β) =============================
+f_tanh(x) =>
+    e2x = math.exp(2 * x)
+    (e2x - 1) / (e2x + 1)
+
+curve(x) => 0.5 * (1 + f_tanh(x))
+
+rvn = (RVs - 0.5) * 4.0
+
+f_map_lin(rv, lo, hi) => lo + rv * (hi - lo)
+
+len_pt_base = f_map_lin(RVs, 14.0, 34.0)
+len_ma_base = f_map_lin(RVs, 9.0, 26.0)
+
+len_pt_eff = math.round(clamp(len_pt_base, 14, 34))
+len_ma_eff = math.round(clamp(len_ma_base, 9, 26))
+
+mult_pt_eff = FF_RV_NL ? (0.7 + 0.7 * curve(rvn)) : f_map_lin(RVs, 0.7, 1.4)
+mult_xv_eff = f_map_lin(RVs, 0.8, 1.4)
+mult_dv_eff = f_map_lin(RVs, 0.8, 1.4)
+
+mult_pt_eff := clamp(mult_pt_eff, 0.7, 1.4)
+mult_xv_eff := clamp(mult_xv_eff, 0.8, 1.4)
+mult_dv_eff := clamp(mult_dv_eff, 0.8, 1.4)
+
+// ============================= CTS COMPOSITE (Stage-A) =============================
+w_pt = 0.40
+w_ma = 0.30
+w_lt = 0.15
+w_xv = 0.10
+w_dv = 0.05
+
+[w_pt_n, w_ma_n, w_lt_n] = normW(w_pt, w_ma, w_lt)
+[w_xv_n, w_dv_n, _unused] = normW(w_xv, w_dv, 0.0)
+w_sum_cts = w_pt_n + w_ma_n + w_lt_n + w_xv_n + w_dv_n
+
+atrSafe = math.max(atr14, 1e-8)
+
+// ============================= VEMA (Variable-alpha EMA) =============================
+alpha_pt = 2.0 / (math.max(len_pt_eff, 1.0) + 1.0)
+alpha_ma = 2.0 / (math.max(len_ma_eff, 1.0) + 1.0)
+
+var float vema_pt = na
+var float vema_ma = na
+
+vema_pt := na(vema_pt[1]) ? close : alpha_pt * close + (1.0 - alpha_pt) * vema_pt[1]
+vema_ma := na(vema_ma[1]) ? close : alpha_ma * close + (1.0 - alpha_ma) * vema_ma[1]
+
+ema_pt = vema_pt
+slope_pt = (ema_pt - ema_pt[1]) / atrSafe
+
+macd_raw = ta.ema(close, 12) - ta.ema(close, 26)
+mom_ma = (macd_raw - macd_raw[1]) / atrSafe
+
+lt_line = ta.ema(close, 55)
+trend_lt = math.sign(ema_pt - lt_line) * 1.0
+
+ema_ma = vema_ma
+dev_ema = (close - ema_ma) / atrSafe
+
+cts_raw = w_pt_n * slope_pt + w_ma_n * mom_ma + w_lt_n * trend_lt - w_xv_n * math.abs(atr_z) - w_dv_n * math.abs(dev_ema)
+cts_ema = ta.ema(cts_raw, 3)
+
+cts_final = cts_ema * global_damp
+
+flip = math.sign(nz(cts_final)) != math.sign(nz(cts_final[1])) and math.sign(nz(cts_final)) != 0
+
+// ============================= SPRINT-3: COOLDOWN V2 (Dynamic + Decay) =============================
+mag = math.min(math.abs(rv_mom), 0.10)
+CD_WIN_base = math.round(55.0 - (mag / 0.10) * (55.0 - 21.0))
+
+// ============================= PATCH: Use FF_RVG_ON instead of FF_RV_AWARE_GATES =============================
+cd_mult_raw = (FF_RVG_ON and rv_mid and not risk_off_state) ? (1.50 * prof_cd) : 1.0
+// ============================= END PATCH =============================
+
+cd_mult = clamp(cd_mult_raw, 1.00, 1.75)
+CD_WIN_eff = math.round(clamp(CD_WIN_base * cd_mult, 21, 89))
+
+f_rolling_sum(cond, len) =>
+    sum = 0
+    for i = 0 to len - 1
+        if cond[i]
+            sum := sum + 1
+    sum
+
+flip_cnt = f_rolling_sum(flip, CD_WIN_eff)
+
+var int cd_bars = 0
+var bool cooldown_state = false
+
+if flip_cnt >= CD_FLIP_THRESH
+    cooldown_state := true
+    cd_bars := 13
+else if cooldown_state
+    cd_bars := math.max(cd_bars - 1, 0)
+    if cd_bars == 0
+        cooldown_state := false
+
+if cooldown_state and (rv_mom < -0.05) and (riskoff_fuse == 0)
+    cooldown_state := false
+    cd_bars := 0
+
+// ============================= ANTI-CHOP (updated) =============================
+ema20 = ta.ema(close, 20)
+ext = (close - ema20)/atrSafe
+ext_abs = math.abs(ext)
+
+side_gap_ok_long = (ema20 - low) >= AC_SIDE_GAP_ATR * atr14
+side_gap_ok_short = (high - ema20) >= AC_SIDE_GAP_ATR * atr14
+
+var int burst_flips = 0
+var int burst_window = 0
+var float last_sign = 0.0
+
+cts_sign = math.sign(cts_final)
+burst_flip = cts_sign != 0 and cts_sign != math.sign(nz(last_sign))
+if burst_flip
+    burst_flips := burst_flips + 1
+if cts_sign != 0
+    last_sign := cts_sign
+burst_window := burst_window + 1
+if burst_window >= AC_BURST_LEN
+    burst_window := 0
+    burst_flips := 0
+
+// ============================= HTF =============================
+htf_close = noRepaintHTF(close, "60")
+request_count := request_count + 1
+
+htf_ema20 = noRepaintHTF(ta.ema(close, 20), "60")
+request_count := request_count + 1
+
+sandbox_warn_count := sandbox_warn_count + f_sandbox_warn(na(htf_ema20))
+budget_ok_check = (request_count <= 35) and (plot_count <= 64)
+sandbox_warn_count := sandbox_warn_count + f_sandbox_warn(not budget_ok_check)
+
+// ============================= GATES =============================
+// ============================= PATCH: Use FF_RVG_ON instead of FF_RV_AWARE_GATES =============================
+gate_bias_raw = (FF_RVG_ON and rv_mid and not risk_off_state) ? (0.02 * prof_bias) : 0.0
+// ============================= END PATCH =============================
+
+gate_bias = clamp(gate_bias_raw, 0.00, 0.03)
+
+base_gate = atr_ratio > 1.30 ? 2.2 : 2.0
+gate_enter = base_gate + 0.15 + gate_bias
+gate_exit = base_gate - 0.15 + (0.5 * gate_bias)
+
+var bool need_htf_state = false
+if not need_htf_state and ext_abs > gate_enter
+    need_htf_state := true
+else if need_htf_state and ext_abs < gate_exit
+    need_htf_state := false
+
+htf_ok = cts_final > 0 ? (close > htf_ema20) : (close < htf_ema20)
+gate5_pass = (not need_htf_state) or htf_ok
+
+ext_gate = base_gate + gate_bias
+pb_long = (close <= ema20 + 0.5*atr14) or (close < open)
+pb_short = (close >= ema20 - 0.5*atr14) or (close > open)
+gate1_pass = (ext_abs <= ext_gate) or (pb_long and side_gap_ok_long) or (pb_short and side_gap_ok_short)
+
+dcts = ta.change(cts_final)
+cts_pr = nz(ta.percentrank(cts_final, 200)/100.0, 0.5)
+gate2_pass = cts_final > 0 ? (cts_pr <= 0.95 and dcts >= 0) : (cts_pr >= 0.05 and dcts <= 0)
+
+jsd_high = E >= 0.85
+gate3_pass = not (jsd_high or (atr_z < AC_MIN_ATR_Z) or (burst_flips > AC_MAX_BURSTS))
+
+blocked_by_risk = risk_off_state
+blocked_by_neutral = math.abs(cts_final) >= NEUTRAL_LO and math.abs(cts_final) <= NEUTRAL_HI
+
+gate_pass = gate1_pass and gate2_pass and gate3_pass and gate5_pass and not cooldown_state
+
+// ============================= DVL + PR90 =============================
+dvl_num = ta.stdev(cts_final, 34)
+dvl_den = ta.stdev(cts_final, 288)
+DVL_raw = dvl_num / math.max(dvl_den, 1e-8)
+DVL = bar_index < 300 ? na : clamp(DVL_raw, 0.0, 1.0)
+
+PR90 = ta.percentile_linear_interpolation(nz(DVL, 0.0), 288, 90)
+dvl_tag = na(DVL) ? "warmup" : (DVL < PR90 ? "NORMAL" : "YÜKSEK")
+
+// ============================= SPRINT-4: PID SENTINEL =============================
+rv_trend = math.abs(RVs - 0.5) * 2.0
+
+Kp_base = PID_KP_BASE * prof_kp_mult
+Ki_base = PID_KI_BASE * prof_ki_mult
+Kd_base = PID_KD_BASE * prof_kd_mult
+
+Kp_eff = Kp_base * (0.8 + 0.4 * RVs)
+Ki_eff = Ki_base * (0.7 + 0.6 * rv_trend)
+Kd_eff = Kd_base * (0.8 + 0.4 * RVs)
+
+Kp_final = FF_PID_ADAPTIVE_GAINS ? Kp_eff : Kp_base
+Ki_final = FF_PID_ADAPTIVE_GAINS ? Ki_eff : Ki_base
+Kd_final = FF_PID_ADAPTIVE_GAINS ? Kd_eff : Kd_base
+
+EV = bar_index == 0 ? cts_final : ta.ema(cts_final, PID_ERR_LEN)
+err = cts_final - EV
+
+err_s = ta.ema(err, 3)
+
+var float I = 0.0
+var float P_prev = na
+
+if barstate.isfirst
+    I := 0.0
+
+P = FF_PID ? clamp(Kp_final * err, -0.60, 0.60) : 0.0
+
+// S5-F1.1-k2: I DECAY (P flip, no rv_trend guard)
+var bool i_decay_evt = false
+i_decay_evt := false
+
+if FF_PID_I_DECAY and not na(P_prev)
+    if (math.sign(P) != math.sign(P_prev)) and (math.abs(P) > 1e-6)
+        I := I * I_DECAY_FACTOR
+        i_decay_evt := true
+P_prev := P
+
+I_raw = nz(I, 0.0) + (FF_PID ? Ki_final * err : 0.0)
+I := clamp(I_raw, -PID_IMAX, PID_IMAX)
+
+// S5-F1.1-k2: I DRAIN (mid-RV + risk_off guard, delta-check)
+i_drain_evt = false
+if FF_PID_I_DRAIN_MIDRV and rv_mid and not risk_off_state
+    I_new = I * (1.0 - I_DRAIN_RATE)
+    i_drain_evt := math.abs(I_new - I) > 1e-9
+    I := I_new
+
+I := nz(I, 0.0)
+
+D = FF_PID ? nz(Kd_final * (err_s - err_s[1]), 0.0) : 0.0
+
+u = nz(P, 0.0) + nz(I, 0.0) - nz(D, 0.0)
+rv_gate = RVs < 0.40 ? 0.25 : (RVs < 0.55 ? 0.60 : 1.00)
+
+rs_scale_eff = clamp(1.0 + rv_gate * u, 0.60, 1.40)
+gamma_eff = clamp(1.0 + 0.50 * rv_gate * u, 0.70, 1.30)
+
+// ============================= SPRINT-5 FAZ-1.1: INVARIANTS (Profile-aware) =============================
+var int INV_WIN = 288
+int nbars = math.min(bar_index + 1, INV_WIN)
+bool inv_ready = nbars >= INV_WIN
+
+float pr95_abs = inv_ready ? ta.percentile_linear_interpolation(math.abs(cts_final), INV_WIN, 95) : na
+
+inv_mult = FF_PROFILE ? 
+           (PROFILE_MODE=="Aggressive" ? 1.122 : (PROFILE_MODE=="Defensive" ? 1.078 : 1.10)) : 1.10
+float inv_thr = math.max(1.0, nz(pr95_abs * inv_mult, 1.0))
+bool inv_ok = math.abs(cts_final) <= inv_thr
+
+float thr3 = math.round(inv_thr * 1000.0) / 1000.0
+string inv_txt = inv_ready
+  ? (inv_ok ? "✓ PASS" : "X FAIL (absCTS>" + str.tostring(thr3, "#.###") + ")")
+  : ("— WARMUP (" + str.tostring(nbars) + "/288)")
+
+color inv_color = inv_ok ? color.green : color.gray
+
+// ============================= SPRINT-5 FAZ-0: NORMALIZED PID =============================
+P_norm = FF_PID_NORM_TELEM ? clamp(P / 0.60, -1.0, 1.0) : na
+I_norm = FF_PID_NORM_TELEM ? clamp(I / PID_IMAX, -1.0, 1.0) : na
+D_norm = FF_PID_NORM_TELEM ? clamp(D / 0.30, -1.0, 1.0) : na
+
+// ============================= SPRINT-4: ALERT SYSTEM V1 =============================
+groupAlerts = "Alerts"
+ENABLE_ALERTS = input.bool(true, "Enable Notify", group=groupAlerts)
+ALERT_ON_TICKS = input.bool(true, "Fire intrabar", group=groupAlerts)
+ALERT_TEST_FIRE = input.bool(false, "Test Fire (one-shot)", group=groupAlerts)
+
+alert_armed = gate_pass and not risk_off_state and not cooldown_state
+
+alert_reason = alert_armed ? "notify" :
+               (not gate_pass ? "blocked:gates" :
+                 (risk_off_state ? "blocked:risk" : "blocked:cooldown"))
+
+alert_status = alert_armed ? "ARMED" : alert_reason
+
+g1_str = gate1_pass ? "1" : "0"
+g2_str = gate2_pass ? "1" : "0"
+g3_str = gate3_pass ? "1" : "0"
+g5_str = gate5_pass ? "1" : "0"
+risk_str = risk_off_state ? "1" : "0"
+cd_str = cooldown_state ? "1" : "0"
+
+alert_msg_base = "{\"schema\":\"1.0.0\",\"apex\":\"2.3\",\"build\":\"" + BUILD_TAG + "\",\"mode\":\"indicator\",\"symbol\":\"" + syminfo.ticker + "\",\"tf\":\"" + timeframe.period + "\",\"rv\":" + str.tostring(RVs, "#.###") + ",\"rv_band\":\"" + rv_band_str + "\",\"cts\":" + str.tostring(cts_final, "#.####") + ",\"gates\":{\"g1\":" + g1_str + ",\"g2\":" + g2_str + ",\"g3\":" + g3_str + ",\"g5\":" + g5_str + "},\"gate_bias\":" + str.tostring(gate_bias, "#.###") + ",\"risk\":{\"state\":" + risk_str + ",\"fuse\":" + str.tostring(riskoff_fuse) + "},\"cooldown\":" + cd_str + ",\"cooldown_mult\":" + str.tostring(cd_mult, "#.##") + ",\"pid\":{\"p\":" + str.tostring(P, "#.####") + ",\"i\":" + str.tostring(I, "#.####") + ",\"d\":" + str.tostring(D, "#.####") + "}"
+
+pid_norm_str = FF_PID_NORM_TELEM ? (",\"pid_norm\":{\"p\":" + str.tostring(P_norm, "#.####") + ",\"i\":" + str.tostring(I_norm, "#.####") + ",\"d\":" + str.tostring(D_norm, "#.####") + "}") : ""
+
+pid_gains_str = FF_PID_ADAPTIVE_GAINS ? (",\"pid_gains\":{\"kp\":" + str.tostring(Kp_final, "#.####") + ",\"ki\":" + str.tostring(Ki_final, "#.####") + ",\"kd\":" + str.tostring(Kd_final, "#.####") + "}") : ""
+
+profile_str = FF_PROFILE ? (",\"profile\":\"" + PROFILE_MODE + "\"") : ""
+
+// S5-F1.1: Anti-windup events
+i_decay_str = ",\"i_decay_evt\":" + (i_decay_evt ? "1" : "0")
+i_drain_str = ",\"i_drain_evt\":" + (i_drain_evt ? "1" : "0")
+
+alert_msg_mid = alert_msg_base + pid_norm_str + pid_gains_str + profile_str + i_decay_str + i_drain_str + ",\"reason\":\"" + alert_reason + "\",\"ts\":" + str.tostring(time)
+
+alert_msg = ALERT_ON_TICKS ? (alert_msg_mid + ",\"ts_now\":" + str.tostring(timenow) + "}") : (alert_msg_mid + "}")
+
+if ENABLE_ALERTS and alert_armed
+    alert(alert_msg, freq = ALERT_ON_TICKS ? alert.freq_once_per_bar : alert.freq_once_per_bar_close)
+
+var bool _test_latched = false
+if ENABLE_ALERTS and ALERT_TEST_FIRE and not _test_latched
+    alert(alert_msg, freq=alert.freq_once_per_bar)
+    _test_latched := true
+if not ALERT_TEST_FIRE
+    _test_latched := false
+
+// ============================= EXECUTION =============================
+allow_orders = ORDERS_ENABLED and QTY_GATE > 0.0
+unit_final = 1.0
+unit_final_gated = unit_final * QTY_GATE
+
+long_signal = false
+short_signal = false
+
+if allow_orders
+    na
+
+// ============================= TELEMETRY =============================
+groupDisp = "Display"
+SHOW_TABLE = input.bool(true, "Show Telemetry", group=groupDisp)
+SHOW_RISK_BG = input.bool(true, "Show Risk BG", group=groupDisp)
+COMPACT_VIEW = input.bool(false, "Compact", group=groupDisp)
+SHOW_LOWER_ROWS = input.bool(false, "Show Lower Rows (30-39)", group=groupDisp)
+LIVE_TICK_UPDATES = input.bool(true, "Telemetry: Update Every Tick", group=groupDisp)
+SHOW_G5_DBG = input.bool(false, "Show G5 Debug (Row-13)", group=groupDisp)
+
+bgcolor(SHOW_RISK_BG and risk_off_state ? color.new(color.red, 95) : na)
+
+basis_ema = ta.ema(close, 21)
+plot(basis_ema, "Basis EMA", color.new(color.blue,70))
+plot_count := plot_count + 1
+
+plot(htf_ema20, "HTF EMA20", color.new(color.orange, 80))
+plot_count := plot_count + 1
+
+// ============================= TABLE (ALL ROWS 1-39) =============================
+var table t = na
+
+if SHOW_TABLE and na(t)
+    t := table.new(position.top_right, 2, COMPACT_VIEW?12:40, 
+         bgcolor=color.new(color.black,80), border_color=color.gray, border_width=1)
+
+should_draw = SHOW_TABLE and (barstate.islast or (LIVE_TICK_UPDATES and barstate.isrealtime))
+
+if should_draw
+    
+    banner = "ATLAS Apex 2.3 — S5-F1.1-soft-k2 | Pine:v5 | Build:" + BUILD_TAG
+    table.cell(t, 0, 0, banner, text_color=color.white, bgcolor=color.new(color.blue, 50), text_size=size.small)
+    table.cell(t, 1, 0, "VALUE", text_color=color.white, bgcolor=color.new(color.blue, 50))
+    
+    if SHOW_LOWER_ROWS
+        // LOWER MODE: ONLY ROWS 30-39
+        sb_val = FF_SANDBOX ? str.tostring(sandbox_warn_count) : "—"
+        sb_col = sandbox_warn_count>0 ? color.orange : color.gray
+        table.cell(t,0,1,"[30] Sandbox Warns",text_color=color.white)
+        table.cell(t,1,1,sb_val,text_color=sb_col)
+        
+        htf_val = na(htf_ema20) ? "⚠ NaN" : "✓ OK"
+        htf_col = na(htf_ema20) ? color.red : color.green
+        table.cell(t,0,2,"[31] HTF Status",text_color=color.white)
+        table.cell(t,1,2,htf_val,text_color=htf_col)
+        
+        table.cell(t,0,3,"[32] Invariants",text_color=color.white)
+        table.cell(t,1,3,inv_txt,text_color=inv_color)
+        
+        table.cell(t,0,4,"[33] cts_final",text_color=color.white)
+        table.cell(t,1,4,str.tostring(cts_final,"#.####"),text_color=cts_final>0?color.green:color.red)
+        
+        table.cell(t,0,5,"[34] Alert Status",text_color=color.white)
+        alert_color = alert_armed ? color.green : color.gray
+        table.cell(t,1,5,alert_status,text_color=alert_color)
+        
+        pid_status = FF_PID ? "ON" : "OFF"
+        pid_status_col = FF_PID ? color.green : color.gray
+        table.cell(t,0,6,"[35] PID Status",text_color=color.white)
+        table.cell(t,1,6,pid_status,text_color=pid_status_col)
+        
+        pid_norm_val = FF_PID_NORM_TELEM ? 
+                       (str.tostring(P_norm,"#.###") + " / " + str.tostring(I_norm,"#.###") + " / " + str.tostring(D_norm,"#.###")) : 
+                       "—"
+        table.cell(t,0,7,"[36] Pₙ / Iₙ / Dₙ",text_color=color.white)
+        table.cell(t,1,7,pid_norm_val,text_color=FF_PID_NORM_TELEM?color.blue:color.gray)
+        
+        profile_val = FF_PROFILE ? PROFILE_MODE : "—"
+        table.cell(t,0,8,"[37] Profile",text_color=color.white)
+        table.cell(t,1,8,profile_val,text_color=FF_PROFILE?color.aqua:color.gray)
+        
+        table.cell(t,0,9,"[38] Schema",text_color=color.white)
+        table.cell(t,1,9,"1.0.0",text_color=color.silver)
+        
+        // S5-F1.1: Row 39 consolidated
+        kp_mult = FF_PID_ADAPTIVE_GAINS ? clamp(Kp_eff / math.max(Kp_base, 1e-8), 0.5, 1.5) : na
+        ki_mult = FF_PID_ADAPTIVE_GAINS ? clamp(Ki_eff / math.max(Ki_base, 1e-8), 0.5, 1.5) : na
+        kd_mult = FF_PID_ADAPTIVE_GAINS ? clamp(Kd_eff / math.max(Kd_base, 1e-8), 0.5, 1.5) : na
+        
+        kp_str = FF_PID_ADAPTIVE_GAINS ? ("×" + str.tostring(kp_mult, "#.##")) : "—"
+        ki_str = FF_PID_ADAPTIVE_GAINS ? ("×" + str.tostring(ki_mult, "#.##")) : "—"
+        kd_str = FF_PID_ADAPTIVE_GAINS ? ("×" + str.tostring(kd_mult, "#.##")) : "—"
+        
+        gb_str = "+" + str.tostring(gate_bias, "#.###")
+        cdm_str = str.tostring(cd_mult, "#.##")
+        prof_short = FF_PROFILE ? (PROFILE_MODE=="Aggressive"?"Agg":(PROFILE_MODE=="Defensive"?"Def":"Base")) : "Base"
+        
+        row39_val = kp_str+"/"+ki_str+"/"+kd_str+" | rv:"+rv_band_str+" | g:"+gb_str+" | cd×"+cdm_str+" | "+prof_short
+        
+        table.cell(t,0,10,"[39] gains|rv|g|cd|prof",text_color=color.white)
+        table.cell(t,1,10,row39_val,text_color=color.blue)
+        
+    else
+        // UPPER MODE: ALL ROWS 1-39
+        table.cell(t,0,1,"[01] H",text_color=color.white)
+        table.cell(t,1,1,str.tostring(H,"#.###"))
+        
+        table.cell(t,0,2,"[02] E",text_color=color.white)
+        table.cell(t,1,2,str.tostring(E,"#.###"))
+        
+        table.cell(t,0,3,"[03] K",text_color=color.white)
+        table.cell(t,1,3,str.tostring(K,"#.###"))
+        
+        table.cell(t,0,4,"[04] RV",text_color=color.white)
+        table.cell(t,1,4,str.tostring(RV,"#.###"))
+        
+        table.cell(t,0,5,"[05] global_damp",text_color=color.white)
+        table.cell(t,1,5,str.tostring(global_damp,"#.###"))
+        
+        mode_val = allow_orders ? "Strategy ✓ (orders ON)" : "Indicator (orders OFF)"
+        table.cell(t,0,6,"[06] Mode",text_color=color.white)
+        table.cell(t,1,6,mode_val)
+        
+        ff_val = (FF_RV?"R":"—")+"/"+(FF_PID?"P":"—")+"/"+(FF_SANDBOX?"S":"—")+"/"+(FF_RV_NL?"NL":"—")
+        table.cell(t,0,7,"[07] FF_RV/PID/SBX/NL",text_color=color.white)
+        table.cell(t,1,7,ff_val)
+    
+    if not COMPACT_VIEW and not SHOW_LOWER_ROWS
+        rv_val = str.tostring(rv_fast,"#.###")+"/"+str.tostring(rv_slow,"#.###")+"/"+str.tostring(rv_mom,"#.###")
+        table.cell(t,0,8,"[08] RVf/RVs/ΔRV",text_color=color.white)
+        table.cell(t,1,8,rv_val)
+        
+        fsm_val = (risk_off_state?"1":"0")+" / "+str.tostring(riskoff_fuse)
+        table.cell(t,0,9,"[09] R-Off state/fuse",text_color=color.white)
+        table.cell(t,1,9,fsm_val)
+        
+        gate_val = (gate1_pass?"✓":"×")+"/"+(gate2_pass?"✓":"×")+"/"+(gate3_pass?"✓":"×")+"/"+(gate5_pass?"✓":"×")
+        table.cell(t,0,10,"[10] G1/G2/G3/G5",text_color=color.white)
+        table.cell(t,1,10,gate_val)
+        
+        block_val = blocked_by_risk?"risk":(blocked_by_neutral?"neutral":(cooldown_state?"cooldown":"—"))
+        table.cell(t,0,11,"[11] blocked_by",text_color=color.white)
+        table.cell(t,1,11,block_val)
+        
+        dvl_str = na(DVL) ? "warmup" : str.tostring(DVL,"0.##") + " (PR90:" + str.tostring(PR90,"0.##") + ") | " + dvl_tag
+        table.cell(t,0,12,"[12] DVL",text_color=color.white)
+        table.cell(t,1,12,dvl_str)
+        
+        g5_label = SHOW_G5_DBG ? "[13] G5 dbg (need|ext|base)" : "[13] G5 dbg"
+        g5_value = SHOW_G5_DBG ? str.format("{0} | {1,number,#.##} | {2,number,#.##}", 
+                                   need_htf_state ? "1" : "0", ext_abs, base_gate) : "—"
+        table.cell(t,0,13,g5_label,text_color=color.white)
+        table.cell(t,1,13,g5_value)
+        
+        table.cell(t,0,14,"[14] len_pt/ma_eff",text_color=color.white)
+        table.cell(t,1,14,str.format("{0} / {1}", len_pt_eff, len_ma_eff))
+        
+        table.cell(t,0,15,"[15] mult_pt/ma_eff",text_color=color.white)
+        table.cell(t,1,15,str.format("{0,number,#.##} / —", mult_pt_eff))
+        
+        table.cell(t,0,16,"[16] mult_xv/dv_eff",text_color=color.white)
+        table.cell(t,1,16,str.format("{0,number,#.##} / {1,number,#.##}", mult_xv_eff, mult_dv_eff))
+        
+        cd_str_row = cooldown_state ? "ON (" + str.tostring(cd_bars) + "/13)" : 
+                                      "OFF (" + str.tostring(flip_cnt) + "/" + str.tostring(CD_WIN_eff) + ")"
+        table.cell(t,0,17,"[17] cooldown_eff",text_color=color.white)
+        table.cell(t,1,17,cd_str_row,text_color=cooldown_state?color.orange:color.gray)
+        
+        cts_abs = math.abs(cts_final)
+        cts_dbg_str = str.tostring(cts_final,"#.####") + " | " + 
+                      str.tostring(cts_abs,"#.###") + " | " + 
+                      str.tostring(RVs,"#.###") + " | " + 
+                      str.tostring(global_damp,"#.##")
+        table.cell(t,0,18,"[18] CTS dbg",text_color=color.white,text_size=size.small)
+        table.cell(t,1,18,cts_dbg_str,text_size=size.small)
+        
+        table.cell(t,0,19,"[19] Slip μ/M/P95",text_color=color.white)
+        table.cell(t,1,19,"—/—/— bps")
+        
+        table.cell(t,0,20,"[20] MFOC",text_color=color.white)
+        table.cell(t,1,20,"— bps")
+        
+        table.cell(t,0,21,"[21] Guard",text_color=color.white)
+        table.cell(t,1,21,"OK")
+        
+        pid_ev_err = FF_PID ? (str.tostring(EV,"#.####") + " / " + str.tostring(err,"#.####")) : "—"
+        table.cell(t,0,22,"[22] EV / err",text_color=color.white)
+        table.cell(t,1,22,pid_ev_err)
+        
+        pid_terms = FF_PID ? (str.tostring(P,"#.###") + " / " + str.tostring(I,"#.###") + " / " + str.tostring(D,"#.###")) : "—"
+        table.cell(t,0,23,"[23] P / I / D",text_color=color.white)
+        table.cell(t,1,23,pid_terms)
+        
+        rs_str = FF_PID ? str.tostring(rs_scale_eff,"#.###") : "—"
+        table.cell(t,0,24,"[24] rs_scale_eff",text_color=color.white)
+        table.cell(t,1,24,rs_str)
+        
+        gamma_str = FF_PID ? str.tostring(gamma_eff,"#.###") : "—"
+        table.cell(t,0,25,"[25] gamma_eff",text_color=color.white)
+        table.cell(t,1,25,gamma_str)
+        
+        rt_val = na(runtime_ms) ? "n/a" : str.tostring(runtime_ms,"#.##")
+        table.cell(t,0,26,"[26] runtime_ms",text_color=color.white)
+        table.cell(t,1,26,rt_val)
+        
+        table.cell(t,0,27,"[27] request_count",text_color=color.white)
+        table.cell(t,1,27,str.tostring(request_count))
+        
+        table.cell(t,0,28,"[28] plot_count",text_color=color.white)
+        table.cell(t,1,28,str.tostring(plot_count))
+        
+        bud_ok = (request_count<=35) and (plot_count<=64)
+        strict_breach = FF_BUDGET_STRICT and ((request_count > 2) or (plot_count > 2))
+        bud_val = strict_breach ? "⚠ STRICT BREACH" : (bud_ok ? "✓ OK (2/2)" : "⚠ OVERSHOOT")
+        bud_col = strict_breach ? color.red : (bud_ok ? color.green : color.orange)
+        table.cell(t,0,29,"[29] Budget Status",text_color=color.white)
+        table.cell(t,1,29,bud_val,text_color=bud_col)
+        
+        sb_val = FF_SANDBOX ? str.tostring(sandbox_warn_count) : "—"
+        sb_col = sandbox_warn_count>0 ? color.orange : color.gray
+        table.cell(t,0,30,"[30] Sandbox Warns",text_color=color.white)
+        table.cell(t,1,30,sb_val,text_color=sb_col)
+        
+        htf_val = na(htf_ema20) ? "⚠ NaN" : "✓ OK"
+        htf_col = na(htf_ema20) ? color.red : color.green
+        table.cell(t,0,31,"[31] HTF Status",text_color=color.white)
+        table.cell(t,1,31,htf_val,text_color=htf_col)
+        
+        table.cell(t,0,32,"[32] Invariants",text_color=color.white)
+        table.cell(t,1,32,inv_txt,text_color=inv_color)
+        
+        table.cell(t,0,33,"[33] cts_final",text_color=color.white)
+        table.cell(t,1,33,str.tostring(cts_final,"#.####"),text_color=cts_final>0?color.green:color.red)
+        
+        table.cell(t,0,34,"[34] Alert Status",text_color=color.white)
+        alert_color = alert_armed ? color.green : color.gray
+        table.cell(t,1,34,alert_status,text_color=alert_color)
+        
+        pid_status = FF_PID ? "ON" : "OFF"
+        pid_status_col = FF_PID ? color.green : color.gray
+        table.cell(t,0,35,"[35] PID Status",text_color=color.white)
+        table.cell(t,1,35,pid_status,text_color=pid_status_col)
+        
+        pid_norm_val = FF_PID_NORM_TELEM ? 
+                       (str.tostring(P_norm,"#.###") + " / " + str.tostring(I_norm,"#.###") + " / " + str.tostring(D_norm,"#.###")) : 
+                       "—"
+        table.cell(t,0,36,"[36] Pₙ / Iₙ / Dₙ",text_color=color.white)
+        table.cell(t,1,36,pid_norm_val,text_color=FF_PID_NORM_TELEM?color.blue:color.gray)
+        
+        profile_val = FF_PROFILE ? PROFILE_MODE : "—"
+        table.cell(t,0,37,"[37] Profile",text_color=color.white)
+        table.cell(t,1,37,profile_val,text_color=FF_PROFILE?color.aqua:color.gray)
+        
+        table.cell(t,0,38,"[38] Schema",text_color=color.white)
+        table.cell(t,1,38,"1.0.0",text_color=color.silver)
+        
+        // S5-F1.1: Row 39 consolidated
+        kp_mult = FF_PID_ADAPTIVE_GAINS ? clamp(Kp_eff / math.max(Kp_base, 1e-8), 0.5, 1.5) : na
+        ki_mult = FF_PID_ADAPTIVE_GAINS ? clamp(Ki_eff / math.max(Ki_base, 1e-8), 0.5, 1.5) : na
+        kd_mult = FF_PID_ADAPTIVE_GAINS ? clamp(Kd_eff / math.max(Kd_base, 1e-8), 0.5, 1.5) : na
+        
+        kp_str = FF_PID_ADAPTIVE_GAINS ? ("×" + str.tostring(kp_mult, "#.##")) : "—"
+        ki_str = FF_PID_ADAPTIVE_GAINS ? ("×" + str.tostring(ki_mult, "#.##")) : "—"
+        kd_str = FF_PID_ADAPTIVE_GAINS ? ("×" + str.tostring(kd_mult, "#.##")) : "—"
+        
+        gb_str = "+" + str.tostring(gate_bias, "#.###")
+        cdm_str = str.tostring(cd_mult, "#.##")
+        prof_short = FF_PROFILE ? (PROFILE_MODE=="Aggressive"?"Agg":(PROFILE_MODE=="Defensive"?"Def":"Base")) : "Base"
+        
+        row39_val = kp_str+"/"+ki_str+"/"+kd_str+" | rv:"+rv_band_str+" | g:"+gb_str+" | cd×"+cdm_str+" | "+prof_short
+        
+        table.cell(t,0,39,"[39] gains|rv|g|cd|prof",text_color=color.white)
+        table.cell(t,1,39,row39_val,text_color=color.blue)
